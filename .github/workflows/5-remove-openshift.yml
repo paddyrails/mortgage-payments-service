@@ -1,0 +1,46 @@
+name: 5. Remove from OpenShift
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+      confirm_delete:
+        description: 'Type "payments-service" to confirm'
+        required: true
+
+env:
+  SERVICE_NAME: payments-service
+  OPENSHIFT_NAMESPACE: mortgage-app
+
+jobs:
+  remove:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate
+        run: |
+          if [ "${{ github.event.inputs.confirm_delete }}" != "${{ env.SERVICE_NAME }}" ]; then
+            echo "❌ Confirmation failed!"
+            exit 1
+          fi
+      - uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+      - uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+      - name: Remove
+        run: |
+          echo "⚠️ application-service depends on this service"
+          oc scale deployment/${{ env.SERVICE_NAME }} --replicas=0 || true
+          sleep 5
+          oc delete route,service,deployment,configmap -l app=${{ env.SERVICE_NAME }} --ignore-not-found
+          oc delete configmap ${{ env.SERVICE_NAME }}-config --ignore-not-found
+          echo "✅ Removed ${{ env.SERVICE_NAME }}"

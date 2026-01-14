@@ -1,0 +1,42 @@
+name: 3. Verify Health Checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  SERVICE_NAME: payments-service
+  OPENSHIFT_NAMESPACE: mortgage-app
+
+jobs:
+  verify-health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+      - uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+      - name: Get URL and verify
+        run: |
+          URL="https://$(oc get route ${{ env.SERVICE_NAME }} -o jsonpath='{.spec.host}')"
+          echo "🔍 Checking $URL"
+          
+          # Liveness
+          curl -sf "${URL}/api/health/live" && echo "✅ Liveness OK" || exit 1
+          
+          # Readiness
+          curl -s "${URL}/api/health/ready" | jq .
+          
+          # Health
+          curl -s "${URL}/api/health" | jq .

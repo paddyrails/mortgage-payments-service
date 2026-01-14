@@ -1,0 +1,165 @@
+name: 2. Deploy to OpenShift
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        default: 'latest'
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: mortgage/payments-service
+  SERVICE_NAME: payments-service
+  SERVICE_PORT: "5004"
+  OPENSHIFT_NAMESPACE: mortgage-app
+  REPLICAS: "2"
+  CUSTOMER_SERVICE_URL: "http://customer-service.mortgage-app.svc.cluster.local"
+  LOAN_SERVICE_URL: "http://loans-service.mortgage-app.svc.cluster.local"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: image
+        run: echo "uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+      - uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+      - uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Verify dependencies
+        run: |
+          echo "🔍 Checking dependencies..."
+          for svc in customer-service loans-service; do
+            if oc get deployment $svc -n ${{ env.OPENSHIFT_NAMESPACE }} &>/dev/null; then
+              echo "✅ $svc is deployed"
+            else
+              echo "❌ $svc not found! Deploy it first."
+              exit 1
+            fi
+          done
+
+      - name: Create ECR Pull Secret
+        run: |
+          ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          oc delete secret ecr-pull-secret --ignore-not-found -n ${{ env.OPENSHIFT_NAMESPACE }}
+          oc create secret docker-registry ecr-pull-secret \
+            --docker-server=${{ steps.login-ecr.outputs.registry }} \
+            --docker-username=AWS --docker-password=${ECR_PASSWORD} \
+            -n ${{ env.OPENSHIFT_NAMESPACE }}
+          oc secrets link default ecr-pull-secret --for=pull -n ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Deploy
+        run: |
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ${{ env.SERVICE_NAME }}-config
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+          data:
+            ASPNETCORE_ENVIRONMENT: "${{ github.event.inputs.environment }}"
+            ASPNETCORE_URLS: "http://+:${{ env.SERVICE_PORT }}"
+            ServiceUrls__CustomerService: "${{ env.CUSTOMER_SERVICE_URL }}"
+            ServiceUrls__LoanService: "${{ env.LOAN_SERVICE_URL }}"
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: ${{ env.SERVICE_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.SERVICE_NAME }}
+              spec:
+                imagePullSecrets:
+                  - name: ecr-pull-secret
+                containers:
+                  - name: ${{ env.SERVICE_NAME }}
+                    image: ${{ steps.image.outputs.uri }}
+                    ports:
+                      - containerPort: ${{ env.SERVICE_PORT }}
+                    envFrom:
+                      - configMapRef:
+                          name: ${{ env.SERVICE_NAME }}-config
+                    resources:
+                      requests:
+                        memory: "256Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "512Mi"
+                        cpu: "500m"
+                    livenessProbe:
+                      httpGet:
+                        path: /api/health/live
+                        port: ${{ env.SERVICE_PORT }}
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /api/health/ready
+                        port: ${{ env.SERVICE_PORT }}
+                      initialDelaySeconds: 15
+                      periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+          spec:
+            ports:
+              - port: 80
+                targetPort: ${{ env.SERVICE_PORT }}
+            selector:
+              app: ${{ env.SERVICE_NAME }}
+          ---
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+          spec:
+            to:
+              kind: Service
+              name: ${{ env.SERVICE_NAME }}
+            tls:
+              termination: edge
+          EOF
+
+      - name: Wait for rollout
+        run: oc rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --timeout=300s
+
+      - name: Summary
+        run: |
+          ROUTE=$(oc get route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} -o jsonpath='{.spec.host}')
+          echo "## 🚀 Deployed: https://${ROUTE}" >> $GITHUB_STEP_SUMMARY
